@@ -1,0 +1,558 @@
+---
+title: "Analysis of Vancouver TransLink Ridership"
+author: 'Tomasz Puzio | Student ID: 100904335'
+date: "April 2026"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+subtitle: "Evaluating Regional Recovery and Network Intensity (2019-2024)"
+---
+
+# Introduction
+
+The data in this report is sourced from TransLink's Transit Service Performance Review (TSPR). I chose to compare datasets containing 2019 (pre-pandemic) and 2024 (current) ridership to see how the region's transit habits have shifted. TSPR source data does **not** include ridership numbers for 2020 or 2021, thus bypassing ridership levels for the initial pandemic years, instead focusing on pre-pandemic, and the "new normal" for TransLink's network.
+
+The datasets chosen provide a complete look at ridership for individual bus stops, SkyTrain station annual boardings, and the geographic coordinates required to map the system. My analysis primarily explores whether or not the network has fully recovered to its 2019 peak. While a high-level view shows that many of TransLink's services still fall short of their pre-pandemic levels, a closer look reveals a shift in **when** and **where** people are riding. To investigate further, I focused on four key questions:
+
+1.  **Regional Recovery:** Which regions have recovered, which are lagging?
+2.  **Density vs. Demand:** Do population and employment counts predict how busy a station will be in 2024?
+3.  **Intermodal Connectivity:** How important are "transfer points" in funneling bus riders into the SkyTrain network?
+4.  **Operational Reliability:** Does a bus's size or type (i.e. articulated vs. double decker) impact its ability to stay on schedule?
+
+The following visualizations explore each of these questions in turn.
+
+------------------------------------------------------------------------
+
+### Library Imports
+
+```{r setup, results='hide', message=FALSE, warning=FALSE}
+library(tidyverse)
+library(scales)
+library(sf)
+library(maptiles)
+library(tidyterra)
+library(ggridges)
+library(viridis)
+```
+
+------------------------------------------------------------------------
+
+# Regional Recovery
+
+> Which regions have recovered? Which are lagging?
+
+## Plot 1 - Heat map
+
+```{r heatmap, results='hide', message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+
+# Load ridership data.
+stops <- read_csv("data/TransLink_Bus_Stop_Ridership_2019_2024.csv")
+
+# Data manipulation, converting to spatial features.
+stops_sf <- stops |>
+  st_as_sf(coords = c("Stop_Longitude", "Stop_Latitude"), crs = 4326) |>
+  st_transform(32610) |> # Transform to UTM for accurate spatial calculations.
+  # Create a 'Weekly Total' metric for weighting the heatmap.
+  mutate(Stop_Avg_Daily_Boardings_Week = Stop_Avg_Daily_Boardings_MF +
+           Stop_Avg_Daily_Boardings_Sat + 
+           Stop_Avg_Daily_Boardings_SunHol) |>
+  filter(!is.na(Stop_Avg_Daily_Boardings_Week))
+
+# Extract projected coordinates for the 2D density function.
+coords <- st_coordinates(stops_sf)
+stops_sf_coords <- stops_sf |>
+  mutate(lon = as.numeric(coords[,1]), lat = as.numeric(coords[,2]))
+
+# Fetch background tiles for geographic context.
+bg_tiles_bus <- get_tiles(stops_sf, provider = "CartoDB.Positron", zoom = 11)
+
+# Visualization: 2D Density Heatmap faceted by Year.
+ggplot(stops_sf_coords) +
+  
+  geom_spatraster_rgb(data = bg_tiles_bus) +
+  
+  # Use stat_density_2d to show ridership 'hotspots' weighted by boardings.
+  stat_density_2d_filled(aes(x = lon,
+                             y = lat,
+                             fill = after_stat(level),
+                             weight = Stop_Avg_Daily_Boardings_Week),
+                         alpha = 0.6,
+                         bins = 15,
+                         contour_var = "ndensity") +
+  
+  scale_fill_viridis_d(option = "rocket",
+                       direction = -1,
+                       labels = c("Low", rep("", 12), "High")) +
+  
+  # Temporal comparison.
+  facet_wrap(~TSPR_Year) +
+  
+  coord_sf(xlim = c(482000, 530000), 
+           ylim = c(5428000, 5475000), 
+           expand = FALSE) +
+  
+  # Clean aesthetic for spatial data.
+  theme_void() +
+  
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10, face = "bold", margin = margin(b = 5)),
+    legend.margin = margin(l = 10),
+    legend.key.width = unit(0.4, "cm"),
+    legend.key.height = unit(1.5, "cm"),
+    
+    strip.text = element_text(face = "bold", size = 12, margin = margin(b = 5)),
+    plot.title.position = "plot",
+    plot.title    = element_text(hjust = 0, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0, size = 11, margin = margin(b = 10)),
+    plot.caption  = element_text(hjust = 0, color = "grey40", size = 8),
+    
+    plot.margin = margin(t = 10, r = 10, b = 5, l = 10),
+    panel.spacing = unit(1, "lines")
+  ) +
+  
+  guides(fill = guide_coloursteps(
+    title = "Ridership Density",
+    title.position = "top",
+    title.hjust = 0.5,
+    ticks = FALSE,
+    frame.colour = "black",
+    frame.linewidth = 0.2,
+    show.limits = TRUE,
+    direction = "vertical"
+  )) +
+  
+  labs(title = "Spatial Evolution of Bus Ridership (2019–2024)",
+       subtitle = "Weighted Heatmap of Average Weekly Boardings (2019–2024)",
+       caption = "Source: TransLink Open Data. 2020-2021 data omitted as it is unavailable in the source TSPR catalog.")
+```
+
+A weighted 2D density heat map shows the geographic shape of ridership instead of just totals. Each stop's annual boarding volume adds to the “heat”, thus reflecting actual demand intensity. These multi-year comparisons show Vancouver's core holding steady between 2019 (pre-pandemic) and 2024 (the “new normal”), while suburbs- particularly Surrey, show a noticeable intensification. It's worth noting how closely the high-density clusters follow the SkyTrain rail corridors, suggesting buses are serving as feeder into the full rail network.
+
+## Plot 2 - Dumbbell Plot
+
+```{r, dumbbell-plot, results='hide', message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+
+# Load and transform bus performance data for temporal comparison.
+ridership <- read_csv("data/TransLink_Bus_Line_With_Connections.csv") |>
+  
+  # Filter for 2019 and 2024 to evaluate long-term recovery.
+  filter(TSPR_Year %in% c(2019, 2024)) |>
+  select(Line, Line_Name, TSPR_Year, Annual_Boardings) |>
+  group_by(Line, TSPR_Year) |>
+  summarise(
+    Annual_Boardings = sum(Annual_Boardings),
+    .groups = "drop"
+  ) |>
+  
+  # Reshape data from 'Long' to 'Wide' for dumbbell visualization.
+  pivot_wider(
+    names_from = TSPR_Year,
+    values_from = Annual_Boardings,
+    names_prefix = "y"
+  ) |>
+  drop_na(y2019, y2024) |>
+  
+  # Focus on high-impact routes.
+  slice_max(y2019, n = 15) |>
+  
+  # Join names to ensure descriptive y-axis labels.
+  left_join(
+    read_csv("data/TransLink_Bus_Line_With_Connections.csv") |>
+      filter(TSPR_Year == 2019) |>
+      distinct(Line, Line_Name),
+    by = "Line"
+  )
+
+# Visualization: Dumbbell Plot comparing pre-pandemic vs current volumes.
+ggplot(ridership, aes(y = fct_reorder(Line_Name, y2019))) +
+
+  # The 'dumbbell' bar represents the magnitude of the ridership gap
+  geom_segment(aes(x = y2019, xend = y2024, yend = Line_Name), 
+               color = "#e0e0e0", size = 1.5) +
+
+  # 2019 Baseline Point.
+  geom_point(aes(x = y2019), color = "#0881c4", size = 4) +
+
+  # 2024 Current Volume Point.
+  geom_point(aes(x = y2024), color = "#fdc427", size = 4) +
+
+  # Format x-axis for millions.
+  scale_x_continuous(labels = label_number(suffix = "M", scale = 1e-6)) +
+  
+  theme_minimal() +
+  
+  labs(
+    title = "Comparative Analysis of High-Volume (Top 15) Bus Corridors (2019 vs. 2024)",
+    subtitle = "Annual boarding variance between pre-pandemic baselines (Blue) and 2024 (Yellow).",
+    caption = "Source: TransLink Open Data. 2020-2021 data omitted as it is unavailable in the source TSPR catalog.",
+    x = "Annual Boardings (Millions)",
+    y = NULL
+  )
+```
+
+The dumbbell format makes the gap in recovery noticeable at a glance, with the length of each segment (or bar) showing how far a route's demand still sits from its 2019 baseline without the need for two separate charts. Across TransLink's 15 busiest corridors, none have fully closed the gap. The widest segments tend to belong to routes serving Vancouver's downtown office destinations, which aligns with the rise in popularity of hybrid and remote work.
+
+------------------------------------------------------------------------
+
+# Density vs. Demand
+
+> Do population and employment counts predict how busy a station will be in 2024?
+
+## Plot 3 - Bubble Map
+
+```{r, bubble-map, results='hide', message=FALSE, warning=FALSE, fig.height=6, fig.width=11, dpi=300, out.width="100%"}
+
+# Load spatial data for rail infrastructure.
+stations_sf <- st_read("data/TransLink_SkyTrain_Stations_Geo/Rail_Station.shp") |>
+  st_transform(crs = 4326)
+
+lines_sf <- st_read("data/TransLink_SkyTrain_Lines_Geo/Rail_Line.shp") |>
+  st_transform(crs = 4326)
+
+# Define official TransLink brand colors for visual consistency.
+line_Colours <- c("Canada Line" = "#009ddc", "Expo/Millennium Line" = "#00355f", "West Coast Express" = "#820c8e")
+
+# Generate geographic background tiles using CartoDB provider.
+bg_tiles <- get_tiles(stations_sf, provider = "CartoDB.Positron", zoom = 11)
+
+ggplot() +
+  # Layer 1: Background Tiles.
+  geom_spatraster_rgb(data = bg_tiles) +
+  
+  # Layer 2: Station Bubbles, Size represents volume.
+  geom_sf(data = stations_sf,
+          aes(size = Annual_Boa),
+          fill = "#003366",
+          colour = "white",
+          stroke = 0.5,
+          alpha = 0.5,
+          shape = 21) +
+  
+  # Layer 3: Rail Lines.
+  geom_sf(data = lines_sf,
+          aes(colour = Line),
+          linewidth = 1,
+          show.legend = "line") +
+  
+  # Manual scales for professional branding and readable numbers.
+  scale_colour_manual(values = line_Colours,
+                      name = "Transit Line") +
+  
+  scale_size_area(max_size = 20,
+                  breaks = c(1e6, 5e6, 10e6, 15e6, 20e6),
+                  limits = c(0, 25000000),
+                  labels = label_comma(),
+                  name = "Annual Ridership",
+                  guide = guide_legend(
+                    override.aes = list(colour = "#003366",
+                                        linetype = 0)
+                  )) +
+  
+  theme_void() +
+  
+  theme(
+    # Ensure titles are flush with the left margin.
+    plot.title.position  = "plot",
+    plot.caption.position = "plot",
+  
+    # Text Styling.
+    plot.title    = element_text(hjust = 0, margin = margin(l = 30)),
+    plot.subtitle = element_text(hjust = 0, margin = margin(l = 30)),
+    plot.caption  = element_text(hjust = 0, margin = margin(l = 30)),
+  
+    # Legend Styling.
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 12),
+  
+    # Margin Adjustment to prevent clipping.
+    plot.margin = margin(t = 30, r = 30, b = 30, l = 30)
+  ) +
+  
+  labs(
+    title    = "SkyTrain Ridership Volumes (2024)",
+    subtitle = "Annual boarding intensity across Metro Vancouver's rail and commuter lines.",
+    caption  = "Source: TransLink Open Data. Scale represents total annual station boardings."
+  )
+```
+
+By mapping bubble size to annual boardings, the ridership hierarchy of the network is immediately made clear. The Expo and Millennium Lines clearly lead in ridership, the Canada Line a step behind, and the West Coast Express trailing far behind as a niche peak-hour service. It's also worth noting that some of the largest bubbles do not lay in the densest parts of the city, which raises the question explored in the next section.
+
+------------------------------------------------------------------------
+
+# Intermodal Connectivity
+
+> How important are "transfer points" in funneling bus riders into the SkyTrain network?
+
+## Plot 4 - Stacked Bar Chart
+
+```{r, stacked-bar-chart, results='hide', message=FALSE, warning=FALSE}
+
+# Data Manipulation: Quantifying network connectivity.
+connections <- read_csv("data/TransLink_SkyTrain_Stations.csv") |>
+  group_by(Name) |>
+  slice(1) |> # Ensure each station name appears only once.
+  ungroup() |>
+  mutate(
+    # Count semicolons in the connection string to calculate the number of routes.
+    Total_Bus_Connections = str_count(Route_Connections, ";") + 1,
+    Total_Rail_SeaBus_Connections = str_count(
+      str_remove(Rail_SeaBus_Connections, fixed(Line)),
+      ";"
+    ),
+    # Combine metrics for a 'Grand Total' of intermodal connectivity.
+    Total_Connections = Total_Bus_Connections + Total_Rail_SeaBus_Connections
+  ) |>
+  
+  # Select the most connected for the visualization.
+  slice_max(Total_Connections, n = 10) |>
+  # Clean up station names and reorder for a clean descending bar chart.
+  mutate(Name = str_remove(Name, " Station"),
+         Name = fct_reorder(Name, Total_Connections, .desc = TRUE)) |>
+  
+  # Pivot to 'Long' format for stacked bar rendering.
+  pivot_longer(
+    cols = c(Total_Bus_Connections, Total_Rail_SeaBus_Connections),
+    names_to = "Connection_Type",
+    values_to = "Count"
+  ) |>
+  mutate(
+    Connection_Type = recode(Connection_Type,
+                             "Total_Bus_Connections" = "Bus",
+                             "Total_Rail_SeaBus_Connections" = "Rail & SeaBus"
+                             )
+  )
+
+# Visualization: Intermodal Connectivity Hubs.
+ggplot(connections, aes(x = Name, y = Count, fill = Connection_Type)) +
+  geom_col(width = 0.7) +
+  coord_flip() + # Flip for better readability of station names.
+  
+  # Applying color palette.
+  scale_fill_manual(values = c("Bus" = "#00355f", "Rail & SeaBus" = "#fdc427")) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(), # Remove horizontal grid lines for focus.
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Top 10 most connected SkyTrain stations",
+    subtitle = "Ranked by total number of unique bus and rail route connection",
+    x = NULL,
+    y = "Number of Connection Points",
+    fill = "Connection type",
+    caption = "Source: TransLink Open Data"
+  )
+```
+
+Splitting connections into segments bus and rail/SeaBus makes it more clear to see which stations are carrying the most inter-modal connective weight. Vancouver City Centre leads in bus connection volume- funneling riders into the downtown core from across the region. Waterfront station, however, stands out as being the most "multi-modal" hub, providing riders with connections to bus, rail, and SeaBus services.
+
+## Plot 5 - Multivariate Scatter Plot
+
+```{r, scatter-plot, results='hide', warning=FALSE, message=FALSE, fig.height=10, fig.width=10}
+
+# Data Manipulation: Integrating land use and transit metrics.
+density <- read_csv("data/TransLink_SkyTrain_Stations.csv") |>
+  # Create a new column Jobs + Residents.
+  mutate(Pop_Emp = Population + Employment,
+         # Quantify intermodal connectivity for use as a sizing variable.
+         Total_Bus_Connections = str_count(Route_Connections, ";") + 1) |>
+  # Ensure only stations with valid census/employment data are included.
+  filter(!is.na(Pop_Emp))
+
+# TransLink Branding.
+Line_Colours <- c("Canada Line" = "#009ddc", "Expo/Millennium Line" = "#00355f", "West Coast Express" = "#820c8e")
+
+# Visualization: Multivariate Scatter Plot.
+ggplot(density, aes(x = Pop_Emp, y = Annual_Boardings, colour = Line, size = Total_Bus_Connections)) +
+  
+  # Use alpha for overlapping points to visualize 'clumps' of stations.
+  geom_point(alpha = 0.6) +
+  
+  # Format axes for readability.
+  scale_x_continuous(
+    labels = label_number(suffix = "K", scale = 1e-3),
+    limits = c(0, NA),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  
+  scale_y_continuous(labels = label_number(suffix = "M", scale = 1e-6)) +
+  
+  # Add linear regression models to analyze prediction trends.
+  geom_smooth(method = "lm", se = FALSE, aes(size = NULL, group = Line), linewidth = 0.8, show.legend = FALSE) +
+  
+  # Distinguish bus connectivity hubs through bubble scaling.
+  scale_size_continuous(range = c(2, 10), name = "Bus Connections") + 
+
+  scale_colour_manual(values = Line_Colours) +
+  
+  # Styling the legend for clarity.
+  guides(
+    size = guide_legend(override.aes = list(colour = "grey40", fill = "grey40"))
+  ) +
+  
+  labs(
+    title = "Density vs. Rail Ridership (2024)",
+    subtitle = "Analyzing the relationship between local 'Jobs + People' and annual boardings",
+    caption = "Source: TransLink Open Data (2024)",
+    x = "Total Catchment Density (Population + Employment)",
+    y = "Annual Boardings (Millions)"
+  ) +
+  theme_minimal()
+```
+
+This plot explores whether stations in dense, job-rich areas are busy because of that density, or whether something else is driving performance. A positive trend holds across all three lines, but outliers suggest something more interesting- stations with comparatively modest, lower density surroundings still see some of the highest ridership levels. These stations are nearly always major transfer hubs, connecting to other rail, bus, or SeaBus services- suggesting that connectivity is contributing just as much to ridership as density.
+
+## Plot 6 - Ridge Plot
+
+```{r ridge-plot, results='hide', message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+
+# Data Manipulation: Analyzing service character across regions.
+bus_ridership <- read_csv("data/TransLink_Bus_Stop_Ridership_2019_2024.csv") |>
+  
+  # Focus on the most recent complete data year (2024).
+  filter(TSPR_Year == 2024) |>
+  mutate(
+    # Create a 'Weekend Average' by weighting Saturday and Sunday/Holiday data.
+    weekend_avg = (Stop_Avg_Daily_Boardings_Sat + Stop_Avg_Daily_Boardings_SunHol) / 2,
+    # Calculate the ratio of weekend-to-weekday usage to identify 'Leisure Hubs'.
+    weekend_ratio = weekend_avg / Stop_Avg_Daily_Boardings_MF
+  ) |>
+  
+  # Remove stops with zero weekday activity to avoid infinite ratios.
+  filter(Stop_Avg_Daily_Boardings_MF > 0 & !is.na(weekend_ratio)) |>
+  filter(!is.na(Municipality)) |>
+  # Reorder factor levels by median ratio for a clean visualization.
+  mutate(Municipality = fct_reorder(Municipality, weekend_ratio, .fun = median))
+
+# Visualization: Distribution of ridership behavior.
+ggplot(bus_ridership, aes(x = weekend_ratio, y = Municipality, fill = Municipality)) +
+  # Use ridges to show the 'spread' of behavior within each city.
+  geom_density_ridges(
+    alpha = 0.7,
+    scale = 1.2,
+    rel_min_height = 0.01,
+    quantile_lines = TRUE,
+    quantiles = 2,
+    boundary = 0
+  ) +
+  
+  scale_fill_viridis_d(option = "viridis", begin = 0.1, end = 0.9) +
+  scale_x_continuous(breaks = seq(0, 2, 0.5), expand = c(0.01, 0)) +
+  
+  theme_ridges(font_size = 12, grid = TRUE) +
+  
+  # Reference line: 1.0 represents equal ridership on weekends and weekdays.
+  geom_vline(xintercept = 1.0, linetype = "dashed", color = "firebrick", linewidth = 0.8) +
+  
+  labs(
+    title = "Bus Usage Patterns by Municipality (2024)",
+    subtitle = "Median lines help track the distribution shift",
+    x = "Weekend-to-Weekday Ridership Ratio (1.0 = Equal)",
+    y = NULL,
+    caption = "Souce: TransLink Open Data (2024)"
+  ) +
+  
+  theme(
+    legend.position = "none",
+    panel.spacing = unit(0.5, "lines"),
+    plot.title = element_text(face = "bold"),
+  ) +
+  
+  coord_cartesian(xlim = c(0, 2))
+```
+
+Rather than comparing average ridership across municipalities, the ridge plot shows the distribution of weekend-to-weekday ratios. The dashed line at 1.0 marks equal weekday and weekend transit usage. Vancouver and Surrey cluster below the 1.0 mark, reflecting a strong weekday commute pattern. Other outer municipalities like Tsawwassen First Nation show wider, flatter distributions drifting closer to parity, indicating transit in these areas serves a more leisure or errand-oriented purpose.
+
+------------------------------------------------------------------------
+
+# Operational Reliability
+
+> Does a bus's size or type (i.e. articulated vs. double decker) impact its ability to stay on schedule?
+
+## Plot 7 - Lollipop Chart
+
+```{r, lollipop-chart, results='hide', message=FALSE, warning=FALSE, fig.height=7, fig.width=10}
+
+# Data Manipulation: Analyzing service reliability by fleet type.
+bus <- read.csv("data/TransLink_Bus_Line_With_Connections.csv")
+
+bus_summary <- bus |>
+  # Clean string data by removing '%' and converting to numeric.
+  mutate(On_Time_Performance_Percentage = as.numeric(gsub("%", "", On_Time_Performance_Percentage))) |>
+  
+  # Filter out non-bus modes to focus on road fleet performance.
+  filter(Predominant_Vehicle_Type != "SeaBus") |>
+  group_by(Predominant_Vehicle_Type) |>
+  
+  # Aggregate performance data to identify trends by vehicle class.
+  summarize(Mean_Performance = mean(On_Time_Performance_Percentage, na.rm = TRUE)) |>
+  # Reorder for descending ranking.
+  mutate(Predominant_Vehicle_Type = reorder(Predominant_Vehicle_Type, Mean_Performance))
+
+
+# Visualization: Lollipop Chart of Reliability.
+ggplot(bus_summary, aes(x = Mean_Performance, y = Predominant_Vehicle_Type)) +
+
+  # Draw the 'stick' of the lollipop for visual guidance.
+  geom_segment(aes(x = 70, xend = Mean_Performance, yend = Predominant_Vehicle_Type), 
+               colour = "grey70", size = 0.8) +
+  
+  # Draw the 'candy' (data point).
+  geom_point(size = 6, colour = "#00355f") +
+  
+  # Add direct labels to points to improve scannability.
+  geom_text(aes(label = paste0(round(Mean_Performance, 1), "%")), 
+            hjust = -0.6, size = 4, fontface = "bold") +
+  
+  # Format axis with percentage labels and specific limits.
+  scale_x_continuous(labels = function(x) paste0(x, "%"),
+                     limits = c(70, 92),
+                     expand = c(0,0)) +
+  
+  labs(
+    title = "On-Time Performance by Vehicle Type",
+    subtitle = "Average punctuality across TransLink's diverse bus fleet",
+    x = "Mean On-Time Performance (%)",
+    y = NULL,
+    caption = "Source: TransLink Open Data"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 15)),
+    axis.text.y = element_text(face = "bold", color = "black")
+  )
+```
+
+A lollipop chart keeps on-time performance (OTP) differences scannable with only a few vehicle types to compare. Mini-buses rank highest, primarily because they operate on quieter suburban routes. Trolley and articulated trolley buses sit at the bottom, with their OTP sitting below 77%. This observation tells us more about *where* they operate than *what* they are. TransLink's trolley bus network is primarily located in Vancouver's congested downtown core, where staying on schedule is harder, regardless of vehicle type.
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+TransLink's network in 2024 tells a more complex story than a simple recovery metric would suggest. Since 2020, lifestyles have changed- from remote or hybrid work options, to overall growth outwards. Ridership still remains below 2019 pre-pandemic levels across busiest bus corridors- particularly those serving downtown office hubs- but demand hasn't fully disappeared, it has been redistributed.
+
+The suburbs, Surrey in particular, show signs of intensification, and a bus network that is increasingly acting as a feeder system into the SkyTrain network, rather than operating independently. A look at the density around the SkyTrain's stations reinforce this- the strongest predictor of a station's ridership isn't necessarily how many people live or work nearby, but to how many bus routes it's connected to. Intermodal hubs like Waterfront and Commercial-Broadway consistently outperform what their surrounding density alone would predict.
+
+In terms of reliability, vehicle type turned out to be less important than people may think- what really matters is *where* a bus route actually runs. Trolley buses under perform because of the congested corridors they operate in, not because they are trolley buses. Altogether, the data shows a transit system that is in the process of reorganizing and restructuring for a post pandemic city, one where the traditional downtown commute no longer acts as the anchor it once did.
+
+## Sources
+
+<https://experience.arcgis.com/experience/bedca58037104e468cbcf97aa38ca602>
+
+<https://www.arcgis.com/home/item.html?id=11b5561d409843a0ae27f8b490f9dda9>
+
+## AI - Prompts
+
+> Please add brief comments to this code.
